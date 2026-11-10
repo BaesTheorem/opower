@@ -8,10 +8,22 @@ from typing import Any
 import aiohttp
 
 from ..const import USER_AGENT
-from ..exceptions import InvalidAuth
+from ..exceptions import CannotConnect, InvalidAuth
 from .base import UtilityBase
 
 _LOGGER = logging.getLogger(__file__)
+
+# Name of the radio group on the "set up multifactor authentication?" screen.
+MFA_SETUP_FIELD = "secure-account-option"
+
+
+def _asks_mfa_setup(data: dict[str, Any]) -> bool:
+    """Return True if the davinci screen asks to set up multifactor authentication."""
+    try:
+        html = data["screen"]["properties"]["customHTML"]["value"]
+    except (KeyError, TypeError):
+        return False
+    return isinstance(html, str) and MFA_SETUP_FIELD in html
 
 
 class EvergyDavinciWidgetParser(HTMLParser):
@@ -52,6 +64,7 @@ class EvergyLoginHandler:
         self.flowId: str
         self.id: str
         self.new_flow: bool = False
+        self.mfa_setup_prompt: bool = False
 
     async def get_auth_data(self) -> None:
         """Parse davinci widget for api data."""
@@ -229,6 +242,67 @@ class EvergyLoginHandler:
             self.access_token = data.get("access_token")
             if self.access_token is not None:
                 self.new_flow = True
+            self.mfa_setup_prompt = _asks_mfa_setup(data)
+
+    async def decline_mfa_setup(self) -> None:
+        """Answer "No" if Evergy asks to set up multifactor authentication.
+
+        Evergy sometimes puts this question between the login form and the
+        token. The flow has no setCookieWithoutUser capability until the
+        question has an answer, so the next step fails with HTTP 400. The
+        answer is "No" because this client has no MFA handler.
+        """
+        if self.new_flow or not self.mfa_setup_prompt:
+            return
+
+        login_template_url = (
+            self.auth_data["api_root"]
+            + "/"
+            + self.auth_data["company_id"]
+            + "/davinci/connections/"
+            + self.connectionId
+            + "/capabilities/customHTMLTemplate"
+        )
+
+        _LOGGER.warning("Evergy asked to set up multifactor authentication. Answering No.")
+
+        async with self.session.post(
+            login_template_url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Content-Type": "application/json",
+                "Origin": "https://www.evergy.com",
+            },
+            data=json.dumps(
+                {
+                    "id": self.id,
+                    "nextEvent": {
+                        "constructType": "skEvent",
+                        "eventName": "continue",
+                        "params": [],
+                        "eventType": "post",
+                        "postProcess": {},
+                    },
+                    "parameters": {
+                        "buttonType": "form-submit",
+                        "buttonValue": "Next",
+                        MFA_SETUP_FIELD: "No",
+                    },
+                    "eventName": "continue",
+                }
+            ),
+            allow_redirects=False,
+            raise_for_status=True,
+        ) as resp:
+            data = await resp.json()
+            if _asks_mfa_setup(data):
+                raise CannotConnect("Evergy asks to set up multifactor authentication again after the answer No.")
+            self.id = data["id"]
+            self.connectionId = data.get("connectionId", self.connectionId)
+            self.mfa_setup_prompt = False
+            self.access_token = data.get("access_token")
+            if self.access_token is not None:
+                self.new_flow = True
 
     async def get_new_connection_cookie(self) -> None:
         """Set complete to generate cookie."""
@@ -331,6 +405,8 @@ class EvergyLoginHandler:
         await EvergyLoginHandler.submit_login_form(self, username, password)
         """Retrieve new connection id."""
         await EvergyLoginHandler.get_new_connection_id(self)
+        """Answer the multifactor authentication question if Evergy asks it."""
+        await EvergyLoginHandler.decline_mfa_setup(self)
         """Set complete to generate cookie."""
         await EvergyLoginHandler.get_new_connection_cookie(self)
         """Set cookie and generate new access_token."""
